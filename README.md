@@ -21,11 +21,16 @@ cd ../alltarkies && make
 ## Usage
 
 ```
-./alltarkies formula.cnf[.xz] [seed]
+./alltarkies formula.cnf[.xz] [--seeds autarkies.txt] [seed]
 ```
 
 - Input is DIMACS CNF; `.xz` files are decompressed on the fly. The variable
   count is taken from the `p cnf` header line.
+- `--seeds autarkies.txt` reads known autarkies, one per line in DIMACS
+  literal format (`x3 -x5 0`). Each seed is verified to be an autarky of the
+  formula (invalid ones are skipped with a warning), minimized to a prime,
+  reported, and blocked before enumeration starts — useful when comparing
+  against autarkies a SAT solver already found.
 - An optional integer `seed` enables shuffled greedy-drop order (for
   randomization); without it a random seed is used.
 - Ctrl-C (SIGINT) aborts the search gracefully and still prints partial
@@ -41,8 +46,8 @@ autarky 3: 5 -12 40
 
 meaning variables 5 and 40 assigned true, variable 12 assigned false. Lines
 starting with `c` are comments, including final statistics (solver calls,
-greedy/SAT-based minimization removals, root-fixed pruning, decomposition
-counts, total autarkies).
+greedy/SAT-based minimization removals, root-fixed and assumption-propagation
+pruning, decomposition counts, total autarkies).
 
 ## How it works
 
@@ -64,6 +69,12 @@ counts, total autarkies).
 4. **Minimization.** A fixpoint greedy pass (no solver calls), then
    jump-until-UNSAT: each SAT solve jumps to a strictly smaller sub-autarky,
    and UNSAT certifies inclusion-minimality.
+5. **Propagation pruning.** Before every region/minimization query the
+   assumptions are propagated once (`propagate` + `implied`): a conflict
+   answers the query UNSAT without a full solve, and every propagated literal
+   holds in all models of the query, so its variable can never be dropped
+   there — this prunes harvest branches and shrinks the minimization
+   constraint, generalizing the root-level `fixed` pruning.
 
 All queries are assumption/constraint-based (auto-retracted after each
 solve); the only permanent clauses are the encoding and the blocking
