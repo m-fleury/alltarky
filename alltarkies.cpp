@@ -68,277 +68,288 @@ struct Stats {
   long fixed_vars = 0;                  // variables root-fixed at the last outer solve
 };
 
-// ---------------------------------------------------------------- DIMACS
+// ------------------------------------------------------------ alltarkies
 
-std::vector<Clause> parse_dimacs (std::istream & in, int & nvars) {
-  std::vector<Clause> F;
-  std::string line;
-  std::vector<int> cur;
-  nvars = 0;
-  while (std::getline (in, line)) {
-    if (line.empty () || line[0] == 'c' || line[0] == 'p') continue;
-    std::istringstream iss (line);
-    int x;
-    while (iss >> x) {
-      if (x == 0) {
-        if (!cur.empty ()) { F.push_back ({cur}); cur.clear (); }
-      } else {
-        cur.push_back (x);
-        int v = std::abs (x);
-        if (v > nvars) nvars = v;
+class alltarkies {
+
+  // ------------------------------------------------------------ state
+  int n = 0;                            // number of CNF variables
+  int m = 0;                            // number of CNF clauses
+  std::vector<Clause> F;                // the CNF
+  CaDiCaL::Solver solver;               // holds the autarky encoding
+  bool shuffle = false;                 // shuffle greedy drop order (seeded)
+  std::mt19937 rng;
+  Stats st;
+  std::set<std::string> reported;       // keys of reported autarkies
+  std::vector<std::vector<int>> all_autarkies;
+  long found = 0;
+
+public:
+  bool ok = false;                      // input loaded successfully
+
+  alltarkies (const std::string & fname, bool shuffle, unsigned seed);
+  int run ();
+
+private:
+  // ---------------------------------------------------------- DIMACS
+  static std::vector<Clause> parse_dimacs (std::istream & in, int & nvars) {
+    std::vector<Clause> F;
+    std::string line;
+    std::vector<int> cur;
+    nvars = 0;
+    while (std::getline (in, line)) {
+      if (line.empty () || line[0] == 'c' || line[0] == 'p') continue;
+      std::istringstream iss (line);
+      int x;
+      while (iss >> x) {
+        if (x == 0) {
+          if (!cur.empty ()) { F.push_back ({cur}); cur.clear (); }
+        } else {
+          cur.push_back (x);
+          int v = std::abs (x);
+          if (v > nvars) nvars = v;
+        }
       }
     }
+    if (!cur.empty ()) F.push_back ({cur});
+    return F;
   }
-  if (!cur.empty ()) F.push_back ({cur});
-  return F;
-}
 
-// ------------------------------------------------------- autarky checking
-// vals[v] in {-1,0,1}: -1 = unassigned, else truth value.
+  bool load (const std::string & fname);
+  void encode ();
 
-bool is_autarky (const std::vector<Clause> & F, const std::vector<int> & vals) {
-  for (const Clause & C : F) {
-    bool touched = false, sat = false;
-    for (int l : C.lits) {
-      int a = vals[std::abs (l)];
-      if (a >= 0) {
-        touched = true;
-        if ((l > 0) == (a == 1)) sat = true;
-      }
-    }
-    if (touched && !sat) return false;
-  }
-  return true;
-}
+  // ------------------------------------------------- literal helpers
+  // T_v = 2v-1 ("v assigned true"), F_v = 2v ("v assigned false"),
+  // sat_j = 2n+j ("clause j satisfied").
+  int T (int v) const { return 2 * v - 1; }
+  int Fv (int v) const { return 2 * v; }
+  int sat_lit (int j) const { return 2 * n + j; }
 
-// ------------------------------------------------------- literal helpers
-// T_v = 2v-1 ("v assigned true"), F_v = 2v ("v assigned false"),
-// sat_j = 2n+j ("clause j satisfied").
-
-int T (int v) { return 2 * v - 1; }
-int Fv (int v) { return 2 * v; }
-int sat_lit (int n, int j) { return 2 * n + j; }
-
-// read the current model as a partial assignment
-std::vector<int> read_model (CaDiCaL::Solver & solver, int n) {
-  std::vector<int> vals (n + 1, -1);
-  for (int v = 1; v <= n; v++) {
-    bool t = solver.val (T (v)) > 0;
-    bool f = solver.val (Fv (v)) > 0;
-    if (t && !f) vals[v] = 1;
-    else if (f && !t) vals[v] = 0;
-  }
-  return vals;
-}
-
-// canonical key of a partial assignment (for duplicate filtering)
-std::string key_of (int n, const std::vector<int> & vals) {
-  std::string s;
-  for (int v = 1; v <= n; v++)
-    if (vals[v] >= 0) { s += (vals[v] ? "" : "-"); s += std::to_string (v); s += ","; }
-  return s;
-}
-
-// ---------------------------------------------- SAT-based minimization
-// Cheap direct fixpoint greedy (no solver calls).  Never drops the last
-// remaining variable, so the result stays non-trivial.  Dropping v only
-// affects clauses containing v, so those are re-checked via occurrence
-// lists instead of scanning the whole formula.
-void greedy_shrink (CaDiCaL::Solver & solver,
-                    const std::vector<Clause> & F, int n, bool shuffle,
-                    std::mt19937 & rng, std::vector<int> & vals, Stats & st) {
-  std::vector<std::vector<int>> occ (n + 1);
-  for (int j = 0; j < (int) F.size (); j++)
-    for (int l : F[j].lits) occ[std::abs (l)].push_back (j);
-  for (bool changed = true; changed;) {
-    changed = false;
-    std::vector<int> order;
-    // variables fixed at root level are assigned in every future model and
-    // can never be dropped, so do not even try (fixed() is only meaningful
-    // after a solve, when root-level propagation has run)
+  // read the current model as a partial assignment
+  // vals[v] in {-1,0,1}: -1 = unassigned, else truth value.
+  std::vector<int> read_model () {
+    std::vector<int> vals (n + 1, -1);
     for (int v = 1; v <= n; v++) {
-      if (vals[v] < 0) continue;
+      bool t = solver.val (T (v)) > 0;
+      bool f = solver.val (Fv (v)) > 0;
+      if (t && !f) vals[v] = 1;
+      else if (f && !t) vals[v] = 0;
+    }
+    return vals;
+  }
+
+  // canonical key of a partial assignment (for duplicate filtering)
+  std::string key_of (const std::vector<int> & vals) const {
+    std::string s;
+    for (int v = 1; v <= n; v++)
+      if (vals[v] >= 0) { s += (vals[v] ? "" : "-"); s += std::to_string (v); s += ","; }
+    return s;
+  }
+
+  // ------------------------------------------------- autarky checking
+  bool is_autarky (const std::vector<int> & vals) const {
+    for (const Clause & C : F) {
+      bool touched = false, sat = false;
+      for (int l : C.lits) {
+        int a = vals[std::abs (l)];
+        if (a >= 0) {
+          touched = true;
+          if ((l > 0) == (a == 1)) sat = true;
+        }
+      }
+      if (touched && !sat) return false;
+    }
+    return true;
+  }
+
+  // -------------------------------------------- SAT-based minimization
+  // Cheap direct fixpoint greedy (no solver calls).  Never drops the last
+  // remaining variable, so the result stays non-trivial.  Dropping v only
+  // affects clauses containing v, so those are re-checked via occurrence
+  // lists instead of scanning the whole formula.
+  void greedy_shrink (std::vector<int> & vals) {
+    std::vector<std::vector<int>> occ (n + 1);
+    for (int j = 0; j < (int) F.size (); j++)
+      for (int l : F[j].lits) occ[std::abs (l)].push_back (j);
+    for (bool changed = true; changed;) {
+      changed = false;
+      std::vector<int> order;
+      // variables fixed at root level are assigned in every future model and
+      // can never be dropped, so do not even try (fixed() is only meaningful
+      // after a solve, when root-level propagation has run)
+      for (int v = 1; v <= n; v++) {
+        if (vals[v] < 0) continue;
+        if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
+          st.fixed_pruned++;
+          continue;
+        }
+        order.push_back (v);
+      }
+      if (order.size () <= 1) break;
+      if (shuffle) std::shuffle (order.begin (), order.end (), rng);
+      for (int v : order) {
+        int old = vals[v];
+        vals[v] = -1;
+        bool ok = true;
+        for (int j : occ[v]) {
+          const Clause & C = F[j];
+          bool touched = false, sat = false;
+          for (int l : C.lits) {
+            int a = vals[std::abs (l)];
+            if (a >= 0) {
+              touched = true;
+              if ((l > 0) == (a == 1)) {sat = true; break;}
+            }
+          }
+          if (touched && !sat) { ok = false; break; }
+        }
+        if (ok) { changed = true; st.greedy_removed++; }
+        else vals[v] = old;
+      }
+    }
+  }
+
+  // Jump-until-UNSAT: each round asks with ONE temporary constraint clause
+  // (CaDiCaL retracts it automatically after 'solve', like assumptions)
+  // whether a strictly smaller sub-autarky of the current one exists.
+  //   SAT   -> jump to the smaller witness, re-run the greedy, repeat;
+  //   UNSAT -> no proper sub-autarky exists: inclusion-minimal, done.
+  // Total solver calls = number of jumps + 1, instead of one per variable.
+  std::vector<int> minimize_sat (std::vector<int> vals) {
+    greedy_shrink (vals);
+    std::vector<int> dom;
+    for (;;) {
+      for (int v = 1; v <= n; v++) if (vals[v] >= 0) dom.push_back (v);
+      if (dom.empty ()) break;
+      // assumptions: sub-cube of the current autarky (each domain variable
+      // may keep its value or become unassigned; all others stay unassigned)
+      for (int u = 1; u <= n; u++) {
+        if (vals[u] >= 0) solver.assume (vals[u] ? -Fv (u) : -T (u));
+        else { solver.assume (-T (u)); solver.assume (-Fv (u)); }
+      }
+      // constraint clause: at least one domain variable unassigned, i.e.
+      // not at its current value (the opposite polarity is assumed away)
+      for (int v : dom) solver.constrain (vals[v] ? -T (v) : -Fv (v));
+      solver.constrain (0);
+      int res = solver.solve ();
+      if (res == 10) st.sat_calls++;
+      else { st.unsat_calls++; dom.clear (); break; }    // UNSAT: inclusion-minimal
+      std::vector<int> jumped = read_model ();        // SAT: jump down
+      long after = 0;
+      for (int v = 1; v <= n; v++) if (jumped[v] >= 0) after++;
+      st.sat_removed += (long) dom.size () - after;
+      vals = jumped;
+      greedy_shrink(vals);
+      dom.clear ();
+    }
+    return vals;
+  }
+
+  // ------------------------------------------------------- harvesting
+  // (all minimal sub-autarkies of one model), MARCO-style region
+  // recursion.
+  //
+  // Region state: 'dropped' = variables forced unassigned; every other
+  // variable of dom(alpha) is free between "at alpha's value" and
+  // "unassigned" (expressed by assuming the negation of the *opposite*
+  // polarity), and variables outside dom(alpha) are forced unassigned.
+  void harvest (const std::vector<int> & alpha, std::vector<int> & dropped,
+                std::vector<std::vector<int>> & block_list) {
+    std::vector<int> beta;
+    if (dropped.empty ()) {
+      beta = alpha;                      // the model itself is a witness
+    } else {
+      for (int u = 1; u <= n; u++) {
+        if (alpha[u] >= 0) {
+          solver.assume (alpha[u] ? -Fv (u) : -T (u));  // sub-cube of alpha
+          if (std::find (dropped.begin (), dropped.end (), u) != dropped.end ())
+            solver.assume (alpha[u] ? -T (u) : -Fv (u)); // forced unassigned
+        } else {
+          solver.assume (-T (u));
+          solver.assume (-Fv (u));
+        }
+      }
+      int res = solver.solve ();
+      if (res == 10) st.sat_calls++;
+      else { st.unsat_calls++; return; }   // empty region
+      beta = read_model ();
+    }
+    if (!is_autarky (beta)) return;       // cannot happen (encoding)
+
+    std::vector<int> mu = minimize_sat (beta);
+    if (!is_autarky (mu)) {               // debug: verify found autarky
+      std::cerr << "internal error: found assignment is not an autarky" << std::endl;
+      std::abort ();
+    }
+    std::cout << "c after minimization: " << found << " autarkies found so far" << std::endl;
+    const std::string k = key_of (mu);
+    if (!reported.count (k)) {
+      reported.insert (k);
+      block_list.push_back (mu);
+      all_autarkies.push_back (mu);
+      found++;
+      std::cout << "autarky " << found << ":";
+      for (int v = 1; v <= n; v++)
+        if (mu[v] >= 0)
+          std::cout << " " << (mu[v] ? "" : "-") << v;
+      std::cout << std::endl;
+    }
+    // branch: minimal autarkies incomparable to mu must miss some
+    // variable of dom(mu) -- recurse with each such variable dropped.
+    // A root-level fixed variable can never be dropped (the assumption
+    // forcing it unassigned contradicts the root fix, so the region is
+    // empty), hence its branch is skipped.
+    for (int v = 1; v <= n; v++) {
+      if (mu[v] < 0) continue;
+      if (std::find (dropped.begin (), dropped.end (), v) != dropped.end ()) continue;
       if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
         st.fixed_pruned++;
         continue;
       }
-      order.push_back (v);
-    }
-    if (order.size () <= 1) break;
-    if (shuffle) std::shuffle (order.begin (), order.end (), rng);
-    for (int v : order) {
-      int old = vals[v];
-      vals[v] = -1;
-      bool ok = true;
-      for (int j : occ[v]) {
-        const Clause & C = F[j];
-        bool touched = false, sat = false;
-        for (int l : C.lits) {
-          int a = vals[std::abs (l)];
-          if (a >= 0) {
-            touched = true;
-            if ((l > 0) == (a == 1)) {sat = true; break;}
-          }
-        }
-        if (touched && !sat) { ok = false; break; }
-      }
-      if (ok) { changed = true; st.greedy_removed++; }
-      else vals[v] = old;
+      dropped.push_back (v);
+      harvest (alpha, dropped, block_list);
+      dropped.pop_back ();
     }
   }
-}
+};
 
-// Jump-until-UNSAT: each round asks with ONE temporary constraint clause
-// (CaDiCaL retracts it automatically after 'solve', like assumptions)
-// whether a strictly smaller sub-autarky of the current one exists.
-//   SAT   -> jump to the smaller witness, re-run the greedy, repeat;
-//   UNSAT -> no proper sub-autarky exists: inclusion-minimal, done.
-// Total solver calls = number of jumps + 1, instead of one per variable.
-std::vector<int> minimize_sat (CaDiCaL::Solver & solver,
-                               const std::vector<Clause> & F,
-                               int n, bool shuffle, std::mt19937 & rng,
-                               std::vector<int> vals, Stats & st) {
-  greedy_shrink (solver, F, n, shuffle, rng, vals, st);
-  for (;;) {
-    std::vector<int> dom;
-    for (int v = 1; v <= n; v++) if (vals[v] >= 0) dom.push_back (v);
-    if (dom.empty ()) break;
-    // assumptions: sub-cube of the current autarky (each domain variable
-    // may keep its value or become unassigned; all others stay unassigned)
-    for (int u = 1; u <= n; u++) {
-      if (vals[u] >= 0) solver.assume (vals[u] ? -Fv (u) : -T (u));
-      else { solver.assume (-T (u)); solver.assume (-Fv (u)); }
-    }
-    // constraint clause: at least one domain variable unassigned, i.e.
-    // not at its current value (the opposite polarity is assumed away)
-    for (int v : dom) solver.constrain (vals[v] ? -T (v) : -Fv (v));
-    solver.constrain (0);
-    int res = solver.solve ();
-    if (res == 10) st.sat_calls++;
-    else { st.unsat_calls++; break; }      // UNSAT: inclusion-minimal
-    std::vector<int> jumped = read_model (solver, n);   // SAT: jump down
-    long after = 0;
-    for (int v = 1; v <= n; v++) if (jumped[v] >= 0) after++;
-    st.sat_removed += (long) dom.size () - after;
-    vals = jumped;
-    greedy_shrink (solver, F, n, shuffle, rng, vals, st);
-  }
-  return vals;
-}
+// ------------------------------------------------------------ loading
 
-// --------------------------------------------------- harvesting (all
-// minimal sub-autarkies of one model), MARCO-style region recursion.
-//
-// Region state: 'dropped' = variables forced unassigned; every other
-// variable of dom(alpha) is free between "at alpha's value" and
-// "unassigned" (expressed by assuming the negation of the *opposite*
-// polarity), and variables outside dom(alpha) are forced unassigned.
-void harvest (CaDiCaL::Solver & solver,
-              const std::vector<Clause> & F,
-              int n, bool shuffle, std::mt19937 & rng,
-              const std::vector<int> & alpha, std::vector<int> & dropped,
-              std::set<std::string> & reported,
-              std::vector<std::vector<int>> & block_list,
-              std::vector<std::vector<int>> & all_autarkies,
-              long & found, Stats & st) {
-  std::vector<int> beta;
-  if (dropped.empty ()) {
-    beta = alpha;                        // the model itself is a witness
-  } else {
-    for (int u = 1; u <= n; u++) {
-      if (alpha[u] >= 0) {
-        solver.assume (alpha[u] ? -Fv (u) : -T (u));  // sub-cube of alpha
-        if (std::find (dropped.begin (), dropped.end (), u) != dropped.end ())
-          solver.assume (alpha[u] ? -T (u) : -Fv (u)); // forced unassigned
-      } else {
-        solver.assume (-T (u));
-        solver.assume (-Fv (u));
-      }
-    }
-    int res = solver.solve ();
-    if (res == 10) st.sat_calls++;
-    else { st.unsat_calls++; return; }   // empty region
-    beta = read_model (solver, n);
-  }
-  if (!is_autarky (F, beta)) return;     // cannot happen (encoding)
-
-  std::vector<int> mu = minimize_sat (solver, F, n, shuffle, rng, beta, st);
-  if (!is_autarky (F, mu)) {               // debug: verify found autarky
-    std::cerr << "internal error: found assignment is not an autarky" << std::endl;
-    std::abort ();
-  }
-  std::cout << "c after minimization: " << found << " autarkies found so far" << std::endl;
-  const std::string k = key_of (n, mu);
-  if (!reported.count (k)) {
-    reported.insert (k);
-    block_list.push_back (mu);
-    all_autarkies.push_back (mu);
-    found++;
-    std::cout << "autarky " << found << ":";
-    for (int v = 1; v <= n; v++)
-      if (mu[v] >= 0)
-        std::cout << " " << (mu[v] ? "" : "-") << v;
-    std::cout << std::endl;
-  }
-  // branch: minimal autarkies incomparable to mu must miss some
-  // variable of dom(mu) -- recurse with each such variable dropped.
-  // A root-level fixed variable can never be dropped (the assumption
-  // forcing it unassigned contradicts the root fix, so the region is
-  // empty), hence its branch is skipped.
-  for (int v = 1; v <= n; v++) {
-    if (mu[v] < 0) continue;
-    if (std::find (dropped.begin (), dropped.end (), v) != dropped.end ()) continue;
-    if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
-      st.fixed_pruned++;
-      continue;
-    }
-    dropped.push_back (v);
-    harvest (solver, F, n, shuffle, rng, alpha, dropped,
-             reported, block_list, all_autarkies, found, st);
-    dropped.pop_back ();
-  }
-}
-
-} // namespace
-
-int main (int argc, char ** argv) {
-  if (argc < 2) {
-    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [seed]" << std::endl;
-    return 1;
-  }
+bool alltarkies::load (const std::string & fname) {
   // .xz inputs are decompressed on the fly through `xz -dc`.
-  const std::string fname = argv[1];
   std::ifstream file_in;
   std::istringstream pipe_in;
   std::istream * in = nullptr;
   if (fname.size () >= 3 && fname.compare (fname.size () - 3, 3, ".xz") == 0) {
     std::string cmd = "xz -dc -- '" + fname + "'";
     FILE * pipe = popen (cmd.c_str (), "r");
-    if (!pipe) { std::cerr << "cannot pipe " << fname << " through xz" << std::endl; return 1; }
+    if (!pipe) { std::cerr << "cannot pipe " << fname << " through xz" << std::endl; return false; }
     std::string content;
     char buf[4096];
     size_t r;
     while ((r = fread (buf, 1, sizeof (buf), pipe)) > 0) content.append (buf, r);
-    if (pclose (pipe) != 0) { std::cerr << "xz failed on " << fname << std::endl; return 1; }
+    if (pclose (pipe) != 0) { std::cerr << "xz failed on " << fname << std::endl; return false; }
     pipe_in.str (content);
     in = &pipe_in;
   } else {
     file_in.open (fname);
-    if (!file_in) { std::cerr << "cannot open " << fname << std::endl; return 1; }
+    if (!file_in) { std::cerr << "cannot open " << fname << std::endl; return false; }
     in = &file_in;
   }
+  F = parse_dimacs (*in, n);
+  m = (int) F.size ();
+  return true;
+}
 
-  int n = 0;
-  std::vector<Clause> F = parse_dimacs (*in, n);
-  const int m = (int) F.size ();
-  if (n == 0) { std::cout << "c no variables, no non-trivial autarkies" << std::endl; return 0; }
+alltarkies::alltarkies (const std::string & fname, bool sh, unsigned seed)
+  : shuffle (sh), rng (seed) {
+  ok = load (fname);
+  if (ok && n > 0) encode ();
+}
 
-  std::mt19937 rng (argc > 2 ? std::strtoul (argv[2], nullptr, 10)
-                             : std::random_device {} ());
-  const bool shuffle = argc > 2;
+// ------------------------------------------------------------ encoding
 
-  // ---------------------------------------------------------- encoding
-  CaDiCaL::Solver solver;
+void alltarkies::encode () {
   solver.set ("verbose", 0);
   solver.set ("report", 1);
   solver.set ("lucky", 0);
@@ -352,11 +363,11 @@ int main (int argc, char ** argv) {
     if (C.lits.empty ()) continue;   // empty clause can never be touched
     for (int l : C.lits) {           // touching clause j forces sat_j
       int v = std::abs (l);
-      solver.add (-T (v)); solver.add (sat_lit (n, j)); solver.add (0);
-      solver.add (-Fv (v)); solver.add (sat_lit (n, j)); solver.add (0);
+      solver.add (-T (v)); solver.add (sat_lit (j)); solver.add (0);
+      solver.add (-Fv (v)); solver.add (sat_lit (j)); solver.add (0);
     }
     // sat_j only if some literal of clause j is made true
-    solver.add (-sat_lit (n, j));
+    solver.add (-sat_lit (j));
     for (int l : C.lits) solver.add (l > 0 ? T (std::abs (l)) : Fv (std::abs (l)));
     solver.add (0);
   }
@@ -364,30 +375,29 @@ int main (int argc, char ** argv) {
   // non-triviality: at least one variable is assigned
   for (int v = 1; v <= n; v++) { solver.add (T (v)); solver.add (Fv (v)); }
   solver.add (0);
+}
 
-  std::set<std::string> reported;
-  std::vector<std::vector<int>> block_list;
-  std::vector<std::vector<int>> all_autarkies;
-  long found = 0;
-  Stats st;
+// ------------------------------------------------------- enumeration
 
-  // ---------------------------------------------------- enumeration loop
+int alltarkies::run () {
+  if (n == 0) { std::cout << "c no variables, no non-trivial autarkies" << std::endl; return 0; }
+
+  // -------------------------------------------------- enumeration loop
   for (;;) {
     int res = solver.solve ();
     if (res == 10) st.sat_calls++;
     else { st.unsat_calls++; break; }
-    std::vector<int> alpha = read_model (solver, n);
-    if (!is_autarky (F, alpha)) {                // encoding sanity check
+    std::vector<int> alpha = read_model ();
+    if (!is_autarky (alpha)) {                // encoding sanity check
       std::cerr << "internal error: model is not an autarky" << std::endl;
       return 2;
     }
     st.fixed_vars = 0;                 // root-fixed variables right now
     for (int v = 1; v <= n; v++)
       if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) st.fixed_vars++;
-    block_list.clear ();
+    std::vector<std::vector<int>> block_list;
     std::vector<int> dropped;                    // initially nothing dropped
-    harvest (solver, F, n, shuffle, rng, alpha, dropped,
-             reported, block_list, all_autarkies, found, st);
+    harvest (alpha, dropped, block_list);
     if (block_list.empty ()) break;              // safety net
 
     // block the sub-cubes of all harvested minimal autarkies: any future
@@ -423,4 +433,19 @@ int main (int argc, char ** argv) {
     std::cout << std::endl;
   }
   return 0;
+}
+
+} // namespace
+
+int main (int argc, char ** argv) {
+  if (argc < 2) {
+    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [seed]" << std::endl;
+    return 1;
+  }
+  const bool shuffle = argc > 2;
+  const unsigned seed = shuffle ? std::strtoul (argv[2], nullptr, 10)
+                                : std::random_device {} ();
+  alltarkies app (argv[1], shuffle, seed);
+  if (!app.ok) return 1;
+  return app.run ();
 }
