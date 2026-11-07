@@ -16,7 +16,11 @@
 //   harvest (alpha, dropped):
 //     - query (under assumptions) the region of sub-assignments of alpha
 //       in which every variable of 'dropped' is unassigned; UNSAT -> return;
-//     - minimize the witness to a minimal autarky mu (SAT-based, see below);
+//     - at harvest time, split the witness per assignment by union-find over
+//       the touched clauses, merging only opposite-value variable pairs (no
+//       precomputation at load); if each piece is an autarky, minimize every
+//       piece separately, else minimize the whole witness to a minimal
+//       autarky mu (SAT-based, see below);
 //     - report mu, then branch on every v in dom(mu): recurse with v dropped.
 //
 // Completeness of the harvest: any minimal autarky gamma below alpha either
@@ -46,10 +50,12 @@
 
 #include <algorithm>
 #include <csignal>
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <random>
 #include <set>
 #include <sstream>
@@ -77,6 +83,8 @@ struct Stats {
   long sat_removed = 0;                 // variables dropped by minimize_sat jumps
   long fixed_pruned = 0;                // drop attempts / branches skipped (root-fixed)
   long fixed_vars = 0;                  // variables root-fixed at the last outer solve
+  long decomp_witnesses = 0;            // witnesses split by decompose
+  long decomp_pieces = 0;               // pieces those witnesses split into
 };
 
 // ------------------------------------------------------------ alltarkies
@@ -109,7 +117,15 @@ private:
     std::vector<int> cur;
     nvars = 0;
     while (std::getline (in, line)) {
-      if (line.empty () || line[0] == 'c' || line[0] == 'p') continue;
+      if (line.empty () || line[0] == 'c') continue;
+      if (line[0] == 'p') {           // honor the declared variable count
+        std::istringstream iss (line);
+        std::string tag, cnf;
+        int nv = 0, mc = 0;
+        iss >> tag >> cnf >> nv >> mc;
+        if (nv > nvars) nvars = nv;
+        continue;
+      }
       std::istringstream iss (line);
       int x;
       while (iss >> x) {
@@ -173,6 +189,63 @@ private:
     return true;
   }
 
+  // ------------------------------------------------------- union-find
+  // Split dom(vals) into pieces.  In every clause touched by vals, a literal
+  // that is false under vals (the "negative" one) is only kept satisfied by
+  // a literal that is true under vals (the "positive" one), so union each
+  // falsified variable with every satisfying variable of the same clause --
+  // only opposite-value pairs are merged.  Returns true iff there are at
+  // least two pieces; each piece is then an autarky (asserted -- a touched
+  // clause is satisfied either inside the piece or, via an opposite-value
+  // edge, in the same piece), so 'pieces' is a disjoint union of autarkies.
+  // Otherwise returns false and the caller falls back to minimizing the
+  // witness whole.
+  bool decompose (const std::vector<int> & vals,
+                  std::vector<std::vector<int>> & pieces) {
+    pieces.clear ();
+    std::vector<int> parent (n + 1);
+    for (int v = 0; v <= n; v++) parent[v] = v;
+    auto find = [&] (int x) {
+      while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+      return x;
+    };
+    for (const Clause & C : F) {
+      std::vector<int> trues, falses;
+      for (int l : C.lits) {
+        int v = std::abs (l);
+        if (vals[v] < 0) continue;              // only assigned variables
+        bool lit_true = (l > 0) == (vals[v] == 1);
+        (lit_true ? trues : falses).push_back (v);
+      }
+      for (int u : falses)
+        for (int w : trues) {
+          int a = find (u), b = find (w);
+          if (a != b) parent[a] = b;
+        }
+    }
+    std::map<int, size_t> root_idx;
+    std::vector<std::vector<int>> vars_of;
+    for (int v = 1; v <= n; v++) {
+      if (vals[v] < 0) continue;
+      int r = find (v);
+      auto it = root_idx.find (r);
+      if (it == root_idx.end ()) {
+        root_idx[r] = vars_of.size ();
+        vars_of.push_back ({});
+        it = root_idx.find (r);
+      }
+      vars_of[it->second].push_back (v);
+    }
+    if (vars_of.size () < 2) return false;
+    for (const std::vector<int> & vs : vars_of) {
+      std::vector<int> p (n + 1, -1);
+      for (int v : vs) p[v] = vals[v];
+      assert (is_autarky (p));   // opposite-value merging keeps pieces autarkies
+      pieces.push_back (std::move (p));
+    }
+    return true;
+  }
+
   // -------------------------------------------- SAT-based minimization
   // Cheap direct fixpoint greedy (no solver calls).  Never drops the last
   // remaining variable, so the result stays non-trivial.  Dropping v only
@@ -196,9 +269,12 @@ private:
         }
         order.push_back (v);
       }
-      if (order.size () <= 1) break;
+      long remaining = 0;
+      for (int v = 1; v <= n; v++) if (vals[v] >= 0) remaining++;
+      if (remaining <= 1) break;
       if (shuffle) std::shuffle (order.begin (), order.end (), rng);
       for (int v : order) {
+        if (remaining <= 1) break;   // never drop the last remaining variable
         int old = vals[v];
         vals[v] = -1;
         bool ok = true;
@@ -214,7 +290,7 @@ private:
           }
           if (touched && !sat) { ok = false; break; }
         }
-        if (ok) { changed = true; st.greedy_removed++; }
+        if (ok) { changed = true; st.greedy_removed++; remaining--; }
         else vals[v] = old;
       }
     }
@@ -261,6 +337,12 @@ private:
   // (all minimal sub-autarkies of one model), MARCO-style region
   // recursion.
   //
+  // Before minimizing, the witness is split by union-find: in every touched
+  // clause, variables whose literals have opposite truth value under the
+  // witness are unioned (a falsified literal depends on a satisfying one).
+  // If every resulting piece is itself an autarky, the witness is a disjoint
+  // union of autarkies and each piece is minimized separately.
+  //
   // Region state: 'dropped' = variables forced unassigned; every other
   // variable of dom(alpha) is free between "at alpha's value" and
   // "unassigned" (expressed by assuming the negation of the *opposite*
@@ -287,33 +369,50 @@ private:
       else { if (res == 20) st.unsat_calls++; return; }  // empty region
       beta = read_model ();
     }
-    if (!is_autarky (beta)) return;       // cannot happen (encoding)
+    assert (is_autarky (beta));       // cannot happen (encoding)
 
-    std::vector<int> mu = minimize_sat (beta);
-    if (!is_autarky (mu)) {               // debug: verify found autarky
-      std::cerr << "internal error: found assignment is not an autarky" << std::endl;
-      std::abort ();
+    // Cheap decomposition: if dom(beta) splits into clause-disjoint pieces
+    // that are each autarkies, the witness is a disjoint union of autarkies
+    // -- minimize every piece separately instead of minimizing the union and
+    // rediscovering the siblings through branching.
+    std::vector<std::vector<int>> pieces;
+    std::vector<std::vector<int>> mus;
+    if (decompose (beta, pieces)) {
+      st.decomp_witnesses++;
+      st.decomp_pieces += (long) pieces.size ();
+      for (const std::vector<int> & p : pieces) mus.push_back (minimize_sat (p));
     }
-    std::cout << "c after minimization: " << found << " autarkies found so far" << std::endl;
-    const std::string k = key_of (mu);
-    if (!reported.count (k)) {
-      reported.insert (k);
-      block_list.push_back (mu);
-      all_autarkies.push_back (mu);
-      found++;
-      std::cout << "autarky " << found << ":";
-      for (int v = 1; v <= n; v++)
-        if (mu[v] >= 0)
-          std::cout << " " << (mu[v] ? "" : "-") << v;
-      std::cout << std::endl;
+    else
+      mus.push_back (minimize_sat (beta));
+    for (const std::vector<int> & mu : mus) {
+      bool nonempty = false;
+      for (int v = 1; v <= n; v++) if (mu[v] >= 0) { nonempty = true; break; }
+      assert (nonempty && is_autarky (mu));  // must be a non-empty autarky
+      std::cout << "c after minimization: " << found << " autarkies found so far" << std::endl;
+      const std::string k = key_of (mu);
+      if (!reported.count (k)) {
+        reported.insert (k);
+        block_list.push_back (mu);
+        all_autarkies.push_back (mu);
+        found++;
+        std::cout << "autarky " << found << ":";
+        for (int v = 1; v <= n; v++)
+          if (mu[v] >= 0)
+            std::cout << " " << (mu[v] ? "" : "-") << v;
+        std::cout << std::endl;
+      }
     }
-    // branch: minimal autarkies incomparable to mu must miss some
-    // variable of dom(mu) -- recurse with each such variable dropped.
+    // branch: minimal autarkies incomparable to a reported mu must miss some
+    // variable of dom(mu) -- recurse with each such variable dropped (the
+    // domains of the mus are pairwise disjoint, so this concatenates them).
     // A root-level fixed variable can never be dropped (the assumption
     // forcing it unassigned contradicts the root fix, so the region is
     // empty), hence its branch is skipped.
-    for (int v = 1; v <= n; v++) {
-      if (mu[v] < 0) continue;
+    std::vector<int> branch_vars;
+    for (const std::vector<int> & mu : mus)
+      for (int v = 1; v <= n; v++)
+        if (mu[v] >= 0) branch_vars.push_back (v);
+    for (int v : branch_vars) {
       if (std::find (dropped.begin (), dropped.end (), v) != dropped.end ()) continue;
       if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
         st.fixed_pruned++;
@@ -403,10 +502,7 @@ int alltarkies::run () {
     if (res == 10) st.sat_calls++;
     else { if (res == 20) st.unsat_calls++; break; }
     std::vector<int> alpha = read_model ();
-    if (!is_autarky (alpha)) {                // encoding sanity check
-      std::cerr << "internal error: model is not an autarky" << std::endl;
-      return 2;
-    }
+    assert (is_autarky (alpha));              // encoding sanity check
     st.fixed_vars = 0;                 // root-fixed variables right now
     for (int v = 1; v <= n; v++)
       if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) st.fixed_vars++;
@@ -440,6 +536,8 @@ int alltarkies::run () {
             << st.sat_removed << " by sat-based minimization" << std::endl;
   std::cout << "c stats: " << st.fixed_vars << " variables root-fixed at end, "
             << st.fixed_pruned << " drop attempts/branches pruned by fixing" << std::endl;
+  std::cout << "c stats: " << st.decomp_witnesses << " witnesses decomposed into "
+            << st.decomp_pieces << " pieces" << std::endl;
   std::cout << "c stats: " << found << " minimal autarkies" << std::endl;
   std::cout << "c all found autarkies:" << std::endl;
   for (size_t i = 0; i < all_autarkies.size (); i++) {
