@@ -6,12 +6,17 @@
 //   g++ -O2 -std=c++17 -I cadical/src autarkies.cpp cadical/build/libcadical.a -o autarkies
 //
 // Usage:
-//   ./autarkies formula.cnf [seed]
+//   ./autarkies formula.cnf [--seeds autarkies.txt] [seed]
+//
+// --seeds reads known autarkies (one per line, DIMACS literal format ending
+// in 0); each is verified to be an autarky, minimized to a prime, reported,
+// and blocked before enumeration starts.
 //
 // One minimal autarky per line: "autarky k: x3=T x5=F ...".
 //
 // Outer loop: solve the autarky encoding, then *harvest* ALL minimal
-// sub-autarkies of the found model before blocking, MARCO-style:
+// sub-autarkies of the found model, MARCO-style; each reported prime is
+// blocked immediately so later region queries are pruned:
 //
 //   harvest (alpha, dropped):
 //     - query (under assumptions) the region of sub-assignments of alpha
@@ -36,9 +41,15 @@
 //
 // All queries are assumption-based (per-solve, auto-retracted); the only
 // permanent clauses are the sub-cube blocking clauses of the reported
-// minimal autarkies.  Region splitting can in the worst case explore
-// exponentially many nodes (inherent: there can be exponentially many
-// minimal autarkies below one model); duplicates are filtered by key.
+// minimal autarkies.  Before each region/minimization query the assumptions
+// are propagated once (CaDiCaL 'propagate' + 'implied'): a conflict answers
+// the query UNSAT without a full solve, and every propagated literal holds
+// in all models of the query, so its variable can never be dropped there --
+// this prunes branches in the harvest and shrinks the minimization
+// constraint, generalizing the root-level 'fixed' pruning.  Region
+// splitting can in the worst case explore exponentially many nodes
+// (inherent: there can be exponentially many minimal autarkies below one
+// model); duplicates are filtered by key.
 
 #if __has_include(<cadical.hpp>)
 #include <cadical.hpp>
@@ -85,6 +96,9 @@ struct Stats {
   long fixed_vars = 0;                  // variables root-fixed at the last outer solve
   long decomp_witnesses = 0;            // witnesses split by decompose
   long decomp_pieces = 0;               // pieces those witnesses split into
+  long region_pruned = 0;               // region queries skipped (dropped var root-fixed)
+  long prop_unsat = 0;                  // region queries UNSAT by assumption propagation alone
+  long prop_pruned = 0;                 // branches skipped (var propagated by the assumptions)
 };
 
 // ------------------------------------------------------------ alltarkies
@@ -105,6 +119,7 @@ class alltarkies {
 
 public:
   bool ok = false;                      // input loaded successfully
+  std::string seeds_file;               // optional file with seed autarkies
 
   alltarkies (const std::string & fname, bool shuffle, unsigned seed);
   int run ();
@@ -246,6 +261,34 @@ private:
     return true;
   }
 
+  // --------------------------------- assumption propagation pruning
+  // Run unit propagation over the currently assumed literals (plus the
+  // permanent clauses).  Returns 20 if propagation alone conflicts (the
+  // current query is already UNSAT); otherwise fills 'impl' with the trail
+  // literals up to the assumption level -- exactly the literals propagated
+  // by the assumptions (root-level propagation included).  Each of them
+  // holds in every model of the current query, so a variable whose polarity
+  // literal is implied can never be dropped there.  Propagation is monotone:
+  // implied by the full assumption set subsumes implied by any prefix.
+  int propagate_assumptions (std::vector<int> & impl) {
+    impl.clear ();
+    int res = solver.propagate ();
+    if (res == 20) return res;
+    solver.implied (impl);
+    return res;
+  }
+
+  // mark the polarity literals (T_v / F_v) of 'impl' in a lookup table;
+  // sat_j encoding literals in 'impl' are irrelevant here and skipped
+  std::vector<char> implied_table (const std::vector<int> & impl) const {
+    std::vector<char> implied (2 * n + 2, 0);
+    for (int l : impl) {
+      int a = std::abs (l);
+      if (a <= 2 * n) implied[a] = 1;
+    }
+    return implied;
+  }
+
   // -------------------------------------------- SAT-based minimization
   // Cheap direct fixpoint greedy (no solver calls).  Never drops the last
   // remaining variable, so the result stays non-trivial.  Dropping v only
@@ -315,9 +358,23 @@ private:
         if (vals[u] >= 0) solver.assume (vals[u] ? -Fv (u) : -T (u));
         else { solver.assume (-T (u)); solver.assume (-Fv (u)); }
       }
-      // constraint clause: at least one domain variable unassigned, i.e.
-      // not at its current value (the opposite polarity is assumed away)
-      for (int v : dom) solver.constrain (vals[v] ? -T (v) : -Fv (v));
+      // literals propagated by these assumptions hold in every sub-autarky of
+      // the current one, so their variables cannot be dropped: leave them
+      // out of the constraint (cannot conflict here -- vals is a model)
+      std::vector<int> impl;
+      propagate_assumptions (impl);
+      std::vector<char> implied = implied_table (impl);
+      // constraint clause: at least one droppable domain variable unassigned,
+      // i.e. not at its current value (the opposite polarity is assumed away)
+      bool any_droppable = false;
+      for (int v : dom)
+        if (!implied[T (v)] && !implied[Fv (v)]) {
+          solver.constrain (vals[v] ? -T (v) : -Fv (v));
+          any_droppable = true;
+        }
+      // every domain variable is propagated by the assumptions: no sub-autarky
+      // of vals can drop anything, so vals is already minimal -- no solve
+      if (!any_droppable) { dom.clear (); break; }
       solver.constrain (0);
       int res = solver.solve ();
       if (res == 10) st.sat_calls++;
@@ -331,6 +388,62 @@ private:
       dom.clear ();
     }
     return vals;
+  }
+
+  // Report a prime autarky (deduplicated by key) and permanently block its
+  // sub-cube: any other autarky agreeing with mu on dom(mu) would extend mu
+  // and could not be prime, so no prime is lost.  Returns true if new.
+  bool report_prime (const std::vector<int> & mu) {
+    const std::string k = key_of (mu);
+    if (reported.count (k)) return false;
+    reported.insert (k);
+    all_autarkies.push_back (mu);
+    found++;
+    std::cout << "autarky " << found << ":";
+    for (int v = 1; v <= n; v++)
+      if (mu[v] >= 0)
+        std::cout << " " << (mu[v] ? "" : "-") << v;
+    std::cout << std::endl;
+    for (int v = 1; v <= n; v++)
+      if (mu[v] >= 0) solver.add (mu[v] ? -T (v) : -Fv (v));
+    solver.add (0);
+    return true;
+  }
+
+  // Load seed autarkies (one per line, DIMACS literal format ending in 0),
+  // verify each is really an autarky, minimize to a prime, report and
+  // block it upfront so the harvest only explores the rest.
+  void load_seeds () {
+    std::ifstream in (seeds_file);
+    if (!in) { std::cerr << "cannot open seeds file " << seeds_file << std::endl; ok = false; return; }
+    std::string line;
+    long seed_no = 0;
+    while (std::getline (in, line)) {
+      if (line.empty () || line[0] == 'c' || line[0] == 'p') continue;
+      std::istringstream iss (line);
+      std::vector<int> vals (n + 1, -1);
+      bool bad = false;
+      int x;
+      while (iss >> x) {
+        if (x == 0) break;
+        int v = std::abs (x);
+        int val = x > 0 ? 1 : 0;
+        if (v > n || (vals[v] != -1 && vals[v] != val)) bad = true;
+        else vals[v] = val;
+      }
+      seed_no++;
+      bool nonempty = false;
+      for (int v = 1; v <= n; v++) if (vals[v] >= 0) { nonempty = true; break; }
+      if (!nonempty) { std::cerr << "c seed " << seed_no << " is empty, skipped" << std::endl; continue; }
+      if (bad || !is_autarky (vals)) {
+        std::cerr << "c seed " << seed_no << " is not an autarky, skipped" << std::endl;
+        continue;
+      }
+      std::vector<int> mu = minimize_sat (vals);
+      assert (is_autarky (mu));
+      std::cout << "c seed " << seed_no << " accepted, minimized to a prime autarky" << std::endl;
+      report_prime (mu);
+    }
   }
 
   // ------------------------------------------------------- harvesting
@@ -351,9 +464,19 @@ private:
                 std::vector<std::vector<int>> & block_list) {
     if (sigint_received) return;         // unwind on SIGINT
     std::vector<int> beta;
+    std::vector<char> implied;            // polarity literals propagated by the
+                                          // region assumptions (empty at the root)
     if (dropped.empty ()) {
       beta = alpha;                      // the model itself is a witness
     } else {
+      // cheap filter: if any dropped variable is root-fixed (implied by the
+      // permanent clauses, e.g. a blocking clause added since the parent
+      // node), the region is already empty -- no solver call needed
+      for (int v : dropped)
+        if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
+          st.region_pruned++;
+          return;
+        }
       for (int u = 1; u <= n; u++) {
         if (alpha[u] >= 0) {
           solver.assume (alpha[u] ? -Fv (u) : -T (u));  // sub-cube of alpha
@@ -364,6 +487,13 @@ private:
           solver.assume (-Fv (u));
         }
       }
+      // propagate the assumptions: a conflict means the region is empty
+      // without a full solve; otherwise the implied literals hold in every
+      // model of this region (and of its sub-regions), so their variables
+      // can never be dropped below this node
+      std::vector<int> impl;
+      if (propagate_assumptions (impl) == 20) { st.prop_unsat++; return; }
+      implied = implied_table (impl);
       int res = solver.solve ();
       if (res == 10) st.sat_calls++;
       else { if (res == 20) st.unsat_calls++; return; }  // empty region
@@ -389,25 +519,17 @@ private:
       for (int v = 1; v <= n; v++) if (mu[v] >= 0) { nonempty = true; break; }
       assert (nonempty && is_autarky (mu));  // must be a non-empty autarky
       std::cout << "c after minimization: " << found << " autarkies found so far" << std::endl;
-      const std::string k = key_of (mu);
-      if (!reported.count (k)) {
-        reported.insert (k);
-        block_list.push_back (mu);
-        all_autarkies.push_back (mu);
-        found++;
-        std::cout << "autarky " << found << ":";
-        for (int v = 1; v <= n; v++)
-          if (mu[v] >= 0)
-            std::cout << " " << (mu[v] ? "" : "-") << v;
-        std::cout << std::endl;
-      }
+      if (report_prime (mu)) block_list.push_back (mu);
     }
     // branch: minimal autarkies incomparable to a reported mu must miss some
     // variable of dom(mu) -- recurse with each such variable dropped (the
     // domains of the mus are pairwise disjoint, so this concatenates them).
     // A root-level fixed variable can never be dropped (the assumption
     // forcing it unassigned contradicts the root fix, so the region is
-    // empty), hence its branch is skipped.
+    // empty), hence its branch is skipped.  The same holds for a variable
+    // whose polarity literal is propagated by this region's assumptions: the
+    // sub-region adds assumptions, so the literal stays implied and the
+    // branch is empty as well.
     std::vector<int> branch_vars;
     for (const std::vector<int> & mu : mus)
       for (int v = 1; v <= n; v++)
@@ -416,6 +538,10 @@ private:
       if (std::find (dropped.begin (), dropped.end (), v) != dropped.end ()) continue;
       if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
         st.fixed_pruned++;
+        continue;
+      }
+      if (!implied.empty () && (implied[T (v)] || implied[Fv (v)])) {
+        st.prop_pruned++;
         continue;
       }
       dropped.push_back (v);
@@ -494,6 +620,11 @@ void alltarkies::encode () {
 
 int alltarkies::run () {
   if (n == 0) { std::cout << "c no variables, no non-trivial autarkies" << std::endl; return 0; }
+  if (!seeds_file.empty ()) {
+    load_seeds ();
+    if (!ok) return 1;
+    std::cout << "c " << found << " seed autarkies loaded" << std::endl;
+  }
 
   // -------------------------------------------------- enumeration loop
   for (;;) {
@@ -509,22 +640,7 @@ int alltarkies::run () {
     std::vector<std::vector<int>> block_list;
     std::vector<int> dropped;                    // initially nothing dropped
     harvest (alpha, dropped, block_list);
-    if (block_list.empty ()) break;              // safety net
-
-    // block the sub-cubes of all harvested minimal autarkies: any future
-    // autarky must differ on the domain of each of them.  Sound: if another
-    // minimal autarky gamma agreed with mu on dom(mu), then gamma <= mu,
-    // contradicting mu's minimality unless gamma = mu.
-    for (const std::vector<int> & mu : block_list) {
-      bool any = false;
-      for (int v = 1; v <= n; v++)
-        if (mu[v] >= 0) {
-          solver.add (mu[v] ? -T (v) : -Fv (v));
-          any = true;
-        }
-      if (!any) continue;
-      solver.add (0);
-    }
+    if (block_list.empty ()) break;   // safety net; blocking already done in harvest
   }
 
   if (sigint_received)
@@ -538,6 +654,11 @@ int alltarkies::run () {
             << st.fixed_pruned << " drop attempts/branches pruned by fixing" << std::endl;
   std::cout << "c stats: " << st.decomp_witnesses << " witnesses decomposed into "
             << st.decomp_pieces << " pieces" << std::endl;
+  std::cout << "c stats: " << st.region_pruned
+            << " region queries pruned (dropped variable root-fixed)" << std::endl;
+  std::cout << "c stats: " << st.prop_unsat
+            << " region queries UNSAT by assumption propagation alone, "
+            << st.prop_pruned << " branches pruned (variable propagated)" << std::endl;
   std::cout << "c stats: " << found << " minimal autarkies" << std::endl;
   std::cout << "c all found autarkies:" << std::endl;
   for (size_t i = 0; i < all_autarkies.size (); i++) {
@@ -554,14 +675,25 @@ int alltarkies::run () {
 
 int main (int argc, char ** argv) {
   if (argc < 2) {
-    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [seed]" << std::endl;
+    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [--seeds autarkies.txt] [seed]" << std::endl;
     return 1;
   }
-  const bool shuffle = argc > 2;
-  const unsigned seed = shuffle ? std::strtoul (argv[2], nullptr, 10)
-                                : std::random_device {} ();
+  std::string formula, seeds_file;
+  bool shuffle = false;
+  unsigned seed = std::random_device {} ();
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--seeds" && i + 1 < argc) seeds_file = argv[++i];
+    else if (formula.empty ()) formula = arg;
+    else { shuffle = true; seed = std::strtoul (arg.c_str (), nullptr, 10); }
+  }
+  if (formula.empty ()) {
+    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [--seeds autarkies.txt] [seed]" << std::endl;
+    return 1;
+  }
   std::signal (SIGINT, handle_sigint);
-  alltarkies app (argv[1], shuffle, seed);
+  alltarkies app (formula, shuffle, seed);
+  app.seeds_file = seeds_file;
   if (!app.ok) return 1;
   return app.run ();
 }
