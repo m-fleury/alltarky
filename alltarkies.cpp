@@ -45,6 +45,7 @@
 #endif
 
 #include <algorithm>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -56,6 +57,16 @@
 #include <vector>
 
 namespace {
+
+// SIGINT handling: the handler only sets a flag (async-signal-safe); the
+// solver is aborted through a terminator, and the loops check the flag to
+// unwind so that the final statistics are still printed.
+volatile std::sig_atomic_t sigint_received = 0;
+void handle_sigint (int) { sigint_received = 1; }
+struct SigintTerminator : CaDiCaL::Terminator {
+  bool terminate () override { return sigint_received != 0; }
+};
+SigintTerminator sigint_terminator;
 
 struct Clause { std::vector<int> lits; };
 
@@ -219,6 +230,7 @@ private:
     greedy_shrink (vals);
     std::vector<int> dom;
     for (;;) {
+      if (sigint_received) break;
       for (int v = 1; v <= n; v++) if (vals[v] >= 0) dom.push_back (v);
       if (dom.empty ()) break;
       // assumptions: sub-cube of the current autarky (each domain variable
@@ -233,7 +245,7 @@ private:
       solver.constrain (0);
       int res = solver.solve ();
       if (res == 10) st.sat_calls++;
-      else { st.unsat_calls++; dom.clear (); break; }    // UNSAT: inclusion-minimal
+      else { if (res == 20) st.unsat_calls++; dom.clear (); break; }  // UNSAT: minimal
       std::vector<int> jumped = read_model ();        // SAT: jump down
       long after = 0;
       for (int v = 1; v <= n; v++) if (jumped[v] >= 0) after++;
@@ -255,6 +267,7 @@ private:
   // polarity), and variables outside dom(alpha) are forced unassigned.
   void harvest (const std::vector<int> & alpha, std::vector<int> & dropped,
                 std::vector<std::vector<int>> & block_list) {
+    if (sigint_received) return;         // unwind on SIGINT
     std::vector<int> beta;
     if (dropped.empty ()) {
       beta = alpha;                      // the model itself is a witness
@@ -271,7 +284,7 @@ private:
       }
       int res = solver.solve ();
       if (res == 10) st.sat_calls++;
-      else { st.unsat_calls++; return; }   // empty region
+      else { if (res == 20) st.unsat_calls++; return; }  // empty region
       beta = read_model ();
     }
     if (!is_autarky (beta)) return;       // cannot happen (encoding)
@@ -343,6 +356,7 @@ bool alltarkies::load (const std::string & fname) {
 
 alltarkies::alltarkies (const std::string & fname, bool sh, unsigned seed)
   : shuffle (sh), rng (seed) {
+  solver.connect_terminator (&sigint_terminator);
   ok = load (fname);
   if (ok && n > 0) encode ();
 }
@@ -384,9 +398,10 @@ int alltarkies::run () {
 
   // -------------------------------------------------- enumeration loop
   for (;;) {
+    if (sigint_received) { std::cout << "c interrupted by SIGINT" << std::endl; break; }
     int res = solver.solve ();
     if (res == 10) st.sat_calls++;
-    else { st.unsat_calls++; break; }
+    else { if (res == 20) st.unsat_calls++; break; }
     std::vector<int> alpha = read_model ();
     if (!is_autarky (alpha)) {                // encoding sanity check
       std::cerr << "internal error: model is not an autarky" << std::endl;
@@ -416,6 +431,8 @@ int alltarkies::run () {
     }
   }
 
+  if (sigint_received)
+    std::cout << "c run interrupted by SIGINT, partial results" << std::endl;
   std::cout << "c " << found << " minimal autarkies" << std::endl;
   std::cout << "c stats: " << st.sat_calls << " sat, " << st.unsat_calls << " unsat, "
             << (st.sat_calls + st.unsat_calls) << " total solver calls" << std::endl;
@@ -445,6 +462,7 @@ int main (int argc, char ** argv) {
   const bool shuffle = argc > 2;
   const unsigned seed = shuffle ? std::strtoul (argv[2], nullptr, 10)
                                 : std::random_device {} ();
+  std::signal (SIGINT, handle_sigint);
   alltarkies app (argv[1], shuffle, seed);
   if (!app.ok) return 1;
   return app.run ();
