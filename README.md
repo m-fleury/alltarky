@@ -21,8 +21,18 @@ cd ../alltarkies && make
 ## Usage
 
 ```
-./alltarkies formula.cnf[.xz] [--seeds autarkies.txt] [seed]
+./alltarkies formula.cnf[.xz] [--generators] [--seeds autarkies.txt] [seed]
 ```
+
+- `--generators` enumerates the *generators* of the autarky system — the
+  join-irreducible autarkies, i.e. autarkies that are not a union of strictly
+  smaller autarkies. Every autarky is a union of generators (unlike prime
+  autarkies, which are only the inclusion-minimal ones and do not generate
+  all autarkies under union). A generator is exactly an inclusion-minimal
+  autarky containing some literal l, so the mode runs one MARCO enumeration
+  per polarity literal (in a fresh solver each, so blocking clauses do not
+  leak across literals): assume l, solve, minimize the witness keeping
+  var(l) assigned, report, block its sub-cube, repeat until UNSAT.
 
 - Input is DIMACS CNF; `.xz` files are decompressed on the fly. The variable
   count is taken from the `p cnf` header line.
@@ -84,5 +94,22 @@ there can be exponentially many prime autarkies below one model.
 ## Files
 
 - `alltarkies.cpp` — the whole tool (single file)
+- `ji-autarkies.cpp` — alternative fresh implementation: enumerates *all*
+  autarkies (SAT encoding + exact blocking clauses, exhaustive until UNSAT),
+  each witness is first minimized with solver-based dropping (a literal is
+  dropped iff the autarky without it is still an autarky, a pinned SAT query;
+  greedy dropping yields a prime autarky), then cheap union-find
+  minimization/decomposition (touched clauses are merged, and every touched
+  clause is also merged with the most frequent literal's variable as a hub),
+  then filters the full list for the
+  join-irreducible autarkies (an autarky X is join-irreducible iff the union
+  of all strictly smaller autarkies is a proper subset of X). Preprocessing
+  counts literal occurrences: variables absent from the formula are free
+  (both polarity singletons are join-irreducible and are reported directly,
+  the variable is excluded from the encoding). Build with `make ji`, run
+  `./ji-autarkies formula.cnf[.xz] [--all] [--report]` (`--report` shows the
+  SAT solver's progress reports, off by default). Note the exhaustive
+  enumeration is only feasible for small formulas — the number of autarkies
+  can be exponential.
 - `Makefile` — build against `../cadical`
 - `test.cnf` — example input (49112 variables, 1526724 clauses)

@@ -53,8 +53,8 @@
 
 #if __has_include(<cadical.hpp>)
 #include <cadical.hpp>
-#elif __has_include(<../cadical/src/solver.hpp>)
-#include <../cadical/src/solver.hpp>
+#elif __has_include(<../cadical/src/solver->hpp>)
+#include <../cadical/src/solver->hpp>
 #else
 #include "../cadical/src/cadical.hpp"
 #endif
@@ -67,6 +67,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <random>
 #include <set>
 #include <sstream>
@@ -89,7 +90,7 @@ struct Clause { std::vector<int> lits; };
 
 // run statistics, printed at the end
 struct Stats {
-  long sat_calls = 0, unsat_calls = 0;  // solver.solve() results
+  long sat_calls = 0, unsat_calls = 0;  // solver->solve() results
   long greedy_removed = 0;              // variables dropped by greedy_shrink
   long sat_removed = 0;                 // variables dropped by minimize_sat jumps
   long fixed_pruned = 0;                // drop attempts / branches skipped (root-fixed)
@@ -109,7 +110,10 @@ class alltarkies {
   int n = 0;                            // number of CNF variables
   int m = 0;                            // number of CNF clauses
   std::vector<Clause> F;                // the CNF
-  CaDiCaL::Solver solver;               // holds the autarky encoding
+  std::unique_ptr<CaDiCaL::Solver> solver;  // holds the autarky encoding
+                                             // (re-created per literal in
+                                             // generator mode, so blocking
+                                             // clauses never leak across literals)
   bool shuffle = false;                 // shuffle greedy drop order (seeded)
   std::mt19937 rng;
   Stats st;
@@ -123,6 +127,12 @@ public:
 
   alltarkies (const std::string & fname, bool shuffle, unsigned seed);
   int run ();
+  bool generators = false;              // --generators: enumerate join-irreducible
+                                        // autarkies instead of prime ones
+  long slice_id = -1, slice_count = 1;  // --slice i:K: only handle variables with
+                                        // v % K == i (for parallel runs)
+  bool light_preprocess = false;        // disable expensive solver preprocessing
+                                        // (generator mode re-encodes per literal)
 
 private:
   // ---------------------------------------------------------- DIMACS
@@ -158,7 +168,10 @@ private:
   }
 
   bool load (const std::string & fname);
-  void encode ();
+  void encode (CaDiCaL::Solver & s);
+  void reset_solver ();
+  int run_generators ();
+  bool report_generator (const std::vector<int> & g);
 
   // ------------------------------------------------- literal helpers
   // T_v = 2v-1 ("v assigned true"), F_v = 2v ("v assigned false"),
@@ -172,8 +185,8 @@ private:
   std::vector<int> read_model () {
     std::vector<int> vals (n + 1, -1);
     for (int v = 1; v <= n; v++) {
-      bool t = solver.val (T (v)) > 0;
-      bool f = solver.val (Fv (v)) > 0;
+      bool t = solver->val (T (v)) > 0;
+      bool f = solver->val (Fv (v)) > 0;
       if (t && !f) vals[v] = 1;
       else if (f && !t) vals[v] = 0;
     }
@@ -272,20 +285,22 @@ private:
   // implied by the full assumption set subsumes implied by any prefix.
   int propagate_assumptions (std::vector<int> & impl) {
     impl.clear ();
-    int res = solver.propagate ();
+    int res = solver->propagate ();
     if (res == 20) return res;
-    solver.implied (impl);
+    solver->implied (impl);
     return res;
   }
 
   // mark the polarity literals (T_v / F_v) of 'impl' in a lookup table;
-  // sat_j encoding literals in 'impl' are irrelevant here and skipped
+  // sat_j encoding literals in 'impl' are irrelevant here and skipped.
+  // Only POSITIVE implied literals matter: +T_v (resp. +F_v) implied means
+  // v is assigned true (resp. false) in every model of the query, so v can
+  // never be dropped there; -T_v implied only rules out one polarity and
+  // still allows v to be unassigned.
   std::vector<char> implied_table (const std::vector<int> & impl) const {
     std::vector<char> implied (2 * n + 2, 0);
-    for (int l : impl) {
-      int a = std::abs (l);
-      if (a <= 2 * n) implied[a] = 1;
-    }
+    for (int l : impl)
+      if (l > 0 && l <= 2 * n) implied[l] = 1;
     return implied;
   }
 
@@ -294,7 +309,9 @@ private:
   // remaining variable, so the result stays non-trivial.  Dropping v only
   // affects clauses containing v, so those are re-checked via occurrence
   // lists instead of scanning the whole formula.
-  void greedy_shrink (std::vector<int> & vals) {
+  // 'keep' (if > 0) is a variable that must never be dropped -- used to
+  // compute inclusion-minimal autarkies *containing* a given variable.
+  void greedy_shrink (std::vector<int> & vals, int keep = 0) {
     std::vector<std::vector<int>> occ (n + 1);
     for (int j = 0; j < (int) F.size (); j++)
       for (int l : F[j].lits) occ[std::abs (l)].push_back (j);
@@ -306,7 +323,8 @@ private:
       // after a solve, when root-level propagation has run)
       for (int v = 1; v <= n; v++) {
         if (vals[v] < 0) continue;
-        if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
+        if (v == keep) continue;
+        if (solver->fixed (T (v)) == 1 || solver->fixed (Fv (v)) == 1) {
           st.fixed_pruned++;
           continue;
         }
@@ -345,8 +363,10 @@ private:
   //   SAT   -> jump to the smaller witness, re-run the greedy, repeat;
   //   UNSAT -> no proper sub-autarky exists: inclusion-minimal, done.
   // Total solver calls = number of jumps + 1, instead of one per variable.
-  std::vector<int> minimize_sat (std::vector<int> vals) {
-    greedy_shrink (vals);
+  // 'keep' (if > 0) forces that variable to stay assigned: the result is an
+  // inclusion-minimal autarky among those containing 'keep'.
+  std::vector<int> minimize_sat (std::vector<int> vals, int keep = 0) {
+    greedy_shrink (vals, keep);
     std::vector<int> dom;
     for (;;) {
       if (sigint_received) break;
@@ -354,29 +374,36 @@ private:
       if (dom.empty ()) break;
       // assumptions: sub-cube of the current autarky (each domain variable
       // may keep its value or become unassigned; all others stay unassigned)
-      for (int u = 1; u <= n; u++) {
-        if (vals[u] >= 0) solver.assume (vals[u] ? -Fv (u) : -T (u));
-        else { solver.assume (-T (u)); solver.assume (-Fv (u)); }
-      }
+      auto assume_subcube = [&] () {
+        for (int u = 1; u <= n; u++) {
+          if (u == keep) continue;   // kept assigned via the permanent clause
+          if (vals[u] >= 0) solver->assume (vals[u] ? -Fv (u) : -T (u));
+          else { solver->assume (-T (u)); solver->assume (-Fv (u)); }
+        }
+      };
+      assume_subcube ();
       // literals propagated by these assumptions hold in every sub-autarky of
       // the current one, so their variables cannot be dropped: leave them
       // out of the constraint (cannot conflict here -- vals is a model)
       std::vector<int> impl;
       propagate_assumptions (impl);
+      // 'propagate' consumes the assumptions, so re-add them before the solve
+      assume_subcube ();
       std::vector<char> implied = implied_table (impl);
       // constraint clause: at least one droppable domain variable unassigned,
       // i.e. not at its current value (the opposite polarity is assumed away)
       bool any_droppable = false;
       for (int v : dom)
-        if (!implied[T (v)] && !implied[Fv (v)]) {
-          solver.constrain (vals[v] ? -T (v) : -Fv (v));
+        if (v == keep) continue;   // the kept variable is never dropped
+        else if (!implied[T (v)] && !implied[Fv (v)]) {
+          solver->constrain (vals[v] ? -T (v) : -Fv (v));
           any_droppable = true;
         }
       // every domain variable is propagated by the assumptions: no sub-autarky
       // of vals can drop anything, so vals is already minimal -- no solve
       if (!any_droppable) { dom.clear (); break; }
-      solver.constrain (0);
-      int res = solver.solve ();
+      solver->constrain (0);
+      int res = solver->solve ();
       if (res == 10) st.sat_calls++;
       else { if (res == 20) st.unsat_calls++; dom.clear (); break; }  // UNSAT: minimal
       std::vector<int> jumped = read_model ();        // SAT: jump down
@@ -384,9 +411,13 @@ private:
       for (int v = 1; v <= n; v++) if (jumped[v] >= 0) after++;
       st.sat_removed += (long) dom.size () - after;
       vals = jumped;
-      greedy_shrink(vals);
+      greedy_shrink(vals, keep);
       dom.clear ();
     }
+    // assumptions are only retracted by solve/propagate; if the last round
+    // broke out without a solve, they would leak into the next outer solve
+    // (state is STEADY, so no implicit reset happens) -- clear them here
+    solver->reset_assumptions ();
     return vals;
   }
 
@@ -405,8 +436,8 @@ private:
         std::cout << " " << (mu[v] ? "" : "-") << v;
     std::cout << std::endl;
     for (int v = 1; v <= n; v++)
-      if (mu[v] >= 0) solver.add (mu[v] ? -T (v) : -Fv (v));
-    solver.add (0);
+      if (mu[v] >= 0) solver->add (mu[v] ? -T (v) : -Fv (v));
+    solver->add (0);
     return true;
   }
 
@@ -473,28 +504,37 @@ private:
       // permanent clauses, e.g. a blocking clause added since the parent
       // node), the region is already empty -- no solver call needed
       for (int v : dropped)
-        if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
+        if (solver->fixed (T (v)) == 1 || solver->fixed (Fv (v)) == 1) {
           st.region_pruned++;
           return;
         }
-      for (int u = 1; u <= n; u++) {
-        if (alpha[u] >= 0) {
-          solver.assume (alpha[u] ? -Fv (u) : -T (u));  // sub-cube of alpha
-          if (std::find (dropped.begin (), dropped.end (), u) != dropped.end ())
-            solver.assume (alpha[u] ? -T (u) : -Fv (u)); // forced unassigned
-        } else {
-          solver.assume (-T (u));
-          solver.assume (-Fv (u));
+      auto assume_region = [&] () {
+        for (int u = 1; u <= n; u++) {
+          if (alpha[u] >= 0) {
+            solver->assume (alpha[u] ? -Fv (u) : -T (u));  // sub-cube of alpha
+            if (std::find (dropped.begin (), dropped.end (), u) != dropped.end ())
+              solver->assume (alpha[u] ? -T (u) : -Fv (u)); // forced unassigned
+          } else {
+            solver->assume (-T (u));
+            solver->assume (-Fv (u));
+          }
         }
-      }
+      };
+      assume_region ();
       // propagate the assumptions: a conflict means the region is empty
       // without a full solve; otherwise the implied literals hold in every
       // model of this region (and of its sub-regions), so their variables
       // can never be dropped below this node
       std::vector<int> impl;
-      if (propagate_assumptions (impl) == 20) { st.prop_unsat++; return; }
+      if (propagate_assumptions (impl) == 20) {
+        st.prop_unsat++;
+        solver->reset_assumptions ();   // do not leak them into the outer solve
+        return;
+      }
+      // 'propagate' consumes the assumptions, so re-add them before the solve
+      assume_region ();
       implied = implied_table (impl);
-      int res = solver.solve ();
+      int res = solver->solve ();
       if (res == 10) st.sat_calls++;
       else { if (res == 20) st.unsat_calls++; return; }  // empty region
       beta = read_model ();
@@ -536,7 +576,7 @@ private:
         if (mu[v] >= 0) branch_vars.push_back (v);
     for (int v : branch_vars) {
       if (std::find (dropped.begin (), dropped.end (), v) != dropped.end ()) continue;
-      if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) {
+      if (solver->fixed (T (v)) == 1 || solver->fixed (Fv (v)) == 1) {
         st.fixed_pruned++;
         continue;
       }
@@ -581,44 +621,162 @@ bool alltarkies::load (const std::string & fname) {
 
 alltarkies::alltarkies (const std::string & fname, bool sh, unsigned seed)
   : shuffle (sh), rng (seed) {
-  solver.connect_terminator (&sigint_terminator);
+  reset_solver ();
   ok = load (fname);
-  if (ok && n > 0) encode ();
+  if (ok && n > 0) encode (*solver);
+}
+
+// fresh solver holding only the autarky encoding (used to re-encode per
+// literal in generator mode)
+void alltarkies::reset_solver () {
+  solver = std::make_unique<CaDiCaL::Solver> ();
+  solver->connect_terminator (&sigint_terminator);
 }
 
 // ------------------------------------------------------------ encoding
 
-void alltarkies::encode () {
-  solver.set ("verbose", 0);
-  solver.set ("report", 1);
-  solver.set ("lucky", 0);
-  solver.set ("ilb", 2);
+void alltarkies::encode (CaDiCaL::Solver & s) {
+  s.set ("verbose", 0);
+  s.set ("report", 1);
+  s.set ("lucky", 0);
+  if (light_preprocess) {
+    // per-literal generator runs rebuild the solver 2n times; skip the
+    // expensive preprocessing there, plain CDCL is fast enough
+    s.set ("ilb", 0);
+    s.set ("elimsubst", 0);
+    s.set ("elimeffort", 0);
+    s.set ("elimmineff", 0);
+    s.set ("elimmaxeff", 0);
+    s.set ("preprocesslight", 0);
+  } else {
+    s.set ("ilb", 2);
+    s.set ("elimsubst", 00);
+    s.set ("elimeffort", 50);
+    s.set ("elimmineff", 1e4);
+    s.set ("elimmaxeff", 1e8);
+    s.set ("preprocesslight", 4);
+  }
 
   // at most one polarity per variable
-  for (int v = 1; v <= n; v++) { solver.add (-T (v)); solver.add (-Fv (v)); solver.add (0); }
+  for (int v = 1; v <= n; v++) { s.add (-T (v)); s.add (-Fv (v)); s.add (0); }
 
   for (int j = 1; j <= m; j++) {
     const Clause & C = F[j - 1];
     if (C.lits.empty ()) continue;   // empty clause can never be touched
     for (int l : C.lits) {           // touching clause j forces sat_j
       int v = std::abs (l);
-      solver.add (-T (v)); solver.add (sat_lit (j)); solver.add (0);
-      solver.add (-Fv (v)); solver.add (sat_lit (j)); solver.add (0);
+      s.add (-T (v)); s.add (sat_lit (j)); s.add (0);
+      s.add (-Fv (v)); s.add (sat_lit (j)); s.add (0);
     }
     // sat_j only if some literal of clause j is made true
-    solver.add (-sat_lit (j));
-    for (int l : C.lits) solver.add (l > 0 ? T (std::abs (l)) : Fv (std::abs (l)));
-    solver.add (0);
+    s.add (-sat_lit (j));
+    for (int l : C.lits) s.add (l > 0 ? T (std::abs (l)) : Fv (std::abs (l)));
+    s.add (0);
   }
 
   // non-triviality: at least one variable is assigned
-  for (int v = 1; v <= n; v++) { solver.add (T (v)); solver.add (Fv (v)); }
-  solver.add (0);
+  for (int v = 1; v <= n; v++) { s.add (T (v)); s.add (Fv (v)); }
+  s.add (0);
 }
 
 // ------------------------------------------------------- enumeration
 
+// Report a generator (deduplicated by key) and permanently block its
+// sub-cube for the remainder of the current per-literal enumeration: any
+// other autarky agreeing with g on dom(g) extends g and is not minimal
+// containing its literal, so no generator is lost.  The blocking clause is
+// always added (even for duplicates) so the loop terminates.  Returns true
+// if new.
+bool alltarkies::report_generator (const std::vector<int> & g) {
+  const std::string k = key_of (g);
+  bool is_new = reported.count (k) == 0;
+  if (is_new) {
+    reported.insert (k);
+    all_autarkies.push_back (g);
+    found++;
+    std::cout << "generator " << found << ":";
+    for (int v = 1; v <= n; v++)
+      if (g[v] >= 0)
+        std::cout << " " << (g[v] ? "" : "-") << v;
+    std::cout << std::endl;
+  }
+  for (int v = 1; v <= n; v++)
+    if (g[v] >= 0) solver->add (g[v] ? -T (v) : -Fv (v));
+  solver->add (0);
+  return is_new;
+}
+
+// Enumerate all generators (join-irreducible autarkies).  An autarky G is a
+// generator iff G is an inclusion-minimal autarky *assigning* some variable
+// v (either polarity): if G has essential literal l (v = var(l)) then any
+// proper sub-autarky of G assigning v would contain l; conversely a
+// minimal-assigning-v autarky cannot be a union of proper sub-autarkies
+// (one of them would assign v).  So for every variable v we run a MARCO loop
+// in a FRESH solver (blocking clauses must not leak across variables): add
+// the permanent clause (T_v \/ F_v) forcing v assigned, solve, minimize the
+// witness keeping v, report the result, block its sub-cube, repeat until
+// UNSAT.
+int alltarkies::run_generators () {
+  if (n == 0) { std::cout << "c no variables, no non-trivial autarkies" << std::endl; return 0; }
+  // which polarities occur in the formula at all
+  std::vector<char> has_pos (n + 1, 0), has_neg (n + 1, 0);
+  for (const Clause & C : F)
+    for (int l : C.lits) (l > 0 ? has_pos : has_neg)[std::abs (l)] = 1;
+  for (int v = 1; v <= n; v++) {
+    if (sigint_received) break;
+    if (slice_id >= 0 && (long) v % slice_count != slice_id) continue;
+    // pure / unused variable: the singleton on the occurring polarity (or
+    // either, if unused) is itself an autarky, and the only minimal autarky
+    // assigning v
+    if (!has_neg[v] || !has_pos[v]) {
+      // one polarity never occurs: both singletons are autarkies (the
+      // occurring one satisfies all clauses it touches, the other touches
+      // nothing), and both are the only minimal autarkies assigning v
+      std::vector<int> g1 (n + 1, -1), g0 (n + 1, -1);
+      g1[v] = 1; g0[v] = 0;
+      report_generator (g1);
+      report_generator (g0);
+      continue;
+    }
+    std::cerr << "c var " << v << std::endl;
+    light_preprocess = true;
+    reset_solver ();
+    encode (*solver);
+    light_preprocess = false;
+    solver->add (T (v)); solver->add (Fv (v)); solver->add (0);  // v assigned
+    for (;;) {
+      if (sigint_received) break;
+      int res = solver->solve ();
+      if (res == 10) st.sat_calls++;
+      else { if (res == 20) st.unsat_calls++; break; }
+      std::vector<int> alpha = read_model ();   // before any state transition
+      assert (is_autarky (alpha) && alpha[v] >= 0);
+      std::vector<int> g = minimize_sat (alpha, v);   // keep v assigned
+      assert (is_autarky (g) && g[v] >= 0);
+      report_generator (g);
+    }
+    std::cerr << "c var " << v << " done: "
+              << st.sat_calls << " sat, " << st.unsat_calls << " unsat so far"
+              << std::endl;
+  }
+  if (sigint_received)
+    std::cout << "c run interrupted by SIGINT, partial results" << std::endl;
+  std::cout << "c " << found << " generators" << std::endl;
+  std::cout << "c stats: " << st.sat_calls << " sat, " << st.unsat_calls << " unsat, "
+            << (st.sat_calls + st.unsat_calls) << " total solver calls" << std::endl;
+  std::cout << "c all generators:" << std::endl;
+  for (size_t i = 0; i < all_autarkies.size (); i++) {
+    std::cout << "generator " << (i + 1) << ":";
+    for (int v = 1; v <= n; v++)
+      if (all_autarkies[i][v] >= 0)
+        std::cout << " " << (all_autarkies[i][v] ? v : -v);
+    std::cout << std::endl;
+  }
+  return 0;
+}
+
 int alltarkies::run () {
+  if (generators) return run_generators ();
   if (n == 0) { std::cout << "c no variables, no non-trivial autarkies" << std::endl; return 0; }
   if (!seeds_file.empty ()) {
     load_seeds ();
@@ -629,14 +787,14 @@ int alltarkies::run () {
   // -------------------------------------------------- enumeration loop
   for (;;) {
     if (sigint_received) { std::cout << "c interrupted by SIGINT" << std::endl; break; }
-    int res = solver.solve ();
+    int res = solver->solve ();
     if (res == 10) st.sat_calls++;
     else { if (res == 20) st.unsat_calls++; break; }
     std::vector<int> alpha = read_model ();
     assert (is_autarky (alpha));              // encoding sanity check
     st.fixed_vars = 0;                 // root-fixed variables right now
     for (int v = 1; v <= n; v++)
-      if (solver.fixed (T (v)) == 1 || solver.fixed (Fv (v)) == 1) st.fixed_vars++;
+      if (solver->fixed (T (v)) == 1 || solver->fixed (Fv (v)) == 1) st.fixed_vars++;
     std::vector<std::vector<int>> block_list;
     std::vector<int> dropped;                    // initially nothing dropped
     harvest (alpha, dropped, block_list);
@@ -675,25 +833,37 @@ int alltarkies::run () {
 
 int main (int argc, char ** argv) {
   if (argc < 2) {
-    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [--seeds autarkies.txt] [seed]" << std::endl;
+    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [--generators] [--slice i:K] [--seeds autarkies.txt] [seed]" << std::endl;
     return 1;
   }
   std::string formula, seeds_file;
-  bool shuffle = false;
+  bool shuffle = false, generators = false;
+  long slice_id = -1, slice_count = 1;
   unsigned seed = std::random_device {} ();
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "--seeds" && i + 1 < argc) seeds_file = argv[++i];
+    else if (arg == "--generators") generators = true;
+    else if (arg.rfind ("--slice", 0) == 0) {
+      long k = arg.find (':');
+      if (k != std::string::npos) {
+        slice_id = std::stol (arg.substr (7, k - 7));
+        slice_count = std::stol (arg.substr (k + 1));
+      }
+    }
     else if (formula.empty ()) formula = arg;
     else { shuffle = true; seed = std::strtoul (arg.c_str (), nullptr, 10); }
   }
   if (formula.empty ()) {
-    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [--seeds autarkies.txt] [seed]" << std::endl;
+    std::cerr << "usage: " << argv[0] << " formula.cnf[.xz] [--generators] [--slice i:K] [--seeds autarkies.txt] [seed]" << std::endl;
     return 1;
   }
   std::signal (SIGINT, handle_sigint);
   alltarkies app (formula, shuffle, seed);
   app.seeds_file = seeds_file;
+  app.generators = generators;
+  app.slice_id = slice_id;
+  app.slice_count = slice_count;
   if (!app.ok) return 1;
   return app.run ();
 }
